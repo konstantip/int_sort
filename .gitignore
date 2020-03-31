@@ -2,3 +2,8 @@
 check
 generate
 sort
+result
+source
+*/cmake-build-debug/
+.idea
+adr_file
