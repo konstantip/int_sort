@@ -4,139 +4,274 @@
 #include <iostream>
 #include <list>
 #include <fstream>
-#include <mutex>
 #include <thread>
 #include <experimental/filesystem>
 #include <stdexcept>
 
 #include <notifying_queue.hpp>
 
-//This is the contract
-constexpr std::size_t max_string_size{1000};
-//This is not size of raw available memory,
-// but is estimated num of strings that we can contain
-constexpr std::size_t max_strings_in_memory{12000};
+template <typename T>
+T deserializeForStoringQueue(std::string&&);
 
-void waitForFreeMemory(std::condition_variable& cv, std::atomic_size_t& blocks_in_memory,
-                       const std::size_t max_blocks_in_memory)
+template <>
+std::string deserializeForStoringQueue<std::string>(std::string&& str)
 {
-  std::mutex m;
-  std::unique_lock lk{m};
-  cv.wait(lk, [&blocks_in_memory, max_blocks_in_memory]() noexcept {
-    return blocks_in_memory.fetch_add(0, std::memory_order_relaxed) < max_blocks_in_memory;
-  });
+  return std::move(str);
 }
 
-void waitAndReserve(std::condition_variable& cv, std::atomic_size_t& blocks_in_memory,
-                    const std::size_t max_blocks_in_memory,
-                    std::vector<std::string>& portion, const std::size_t size)
+template <typename T>
+std::string serializeForStoringQueue(T&&);
+
+template<>
+std::string serializeForStoringQueue<std::string>(std::string&& str)
 {
-  waitForFreeMemory(cv, blocks_in_memory, max_blocks_in_memory);
-  blocks_in_memory.fetch_add(1, std::memory_order_relaxed);
-  portion.reserve(size);
+  return std::move(str);
 }
 
-void finalize(std::ifstream& file, std::list<std::string>& strs, std::ofstream& target)
+class Memory final
 {
-  for (const auto& el : strs)
+ public:
+  using ElType = uint32_t;
+
+  explicit Memory(const std::size_t threads_count, const std::size_t num_of_byte) :
+      memory_per_thread_{(num_of_byte / threads_count) / sizeof(ElType)},
+      threads_count_{threads_count},
+      threads_memory_meta_{new ThreadMemory[threads_count]{}},
+      memory_{new ElType[memory_per_thread_ * threads_count]}
   {
-    target << el << '\n';
+    bool used_blocks[threads_count];
+    for (std::size_t i{}; i < threads_count; used_blocks[i++] = false)
+      ;
+
+    {
+      auto& el = threads_memory_meta_[0];
+      el.begin = memory_;
+      el.available_size = memory_per_thread_;
+      el.thread_running = true;
+    }
+    used_blocks[0] = true;
+    for (std::size_t thread_num = 1; thread_num < threads_count;)
+    {
+      std::size_t prev_index = 0;
+      for (std::size_t i = 1; i < threads_count; ++i)
+      {
+        if (used_blocks[i])
+        {
+          if (i - prev_index == 1)
+          {
+            prev_index = i;
+            continue;
+          }
+
+          {
+            const std::size_t index_of_data = prev_index + (i - prev_index) / 2;
+
+            auto& el = threads_memory_meta_[thread_num];
+
+            el.begin = &memory_[index_of_data * memory_per_thread_];
+            el.available_size = memory_per_thread_;
+            el.thread_running = true;
+
+            used_blocks[index_of_data] = true;
+            ++thread_num;
+            prev_index = i;
+          }
+        }
+      }
+
+      {
+        const std::size_t index_of_data = prev_index + (threads_count_ - prev_index) / 2;
+        auto& el = threads_memory_meta_[thread_num];
+        el.begin = &memory_[index_of_data * memory_per_thread_];
+        el.available_size = memory_per_thread_;
+        el.thread_running = true;
+
+        used_blocks[index_of_data] = true;
+        ++thread_num;
+      }
+    }
   }
 
-  for (;;)
+  [[nodiscard]] ElType* memoryBegin() const noexcept
   {
-    std::string tmp;
+    return threads_memory_meta_[memory_index_].begin;
+  }
 
-    file >> tmp;
+  void finishThread() const noexcept
+  {
+    threads_memory_meta_[memory_index_].thread_running = false;
+  }
+
+  void tryBorrow() const noexcept
+  {
+    const auto calculate_next_index = [mi{memory_index_},
+        & available_mem = threads_memory_meta_[memory_index_].available_size,
+        memory_per_thread{memory_per_thread_}]() noexcept -> std::size_t {
+      return mi +
+          available_mem / memory_per_thread;
+    };
+
+    const auto index_exists = [size{threads_count_}](const std::size_t index) {
+      return index < size;
+    };
+
+    for (auto next_index = calculate_next_index(); index_exists(next_index); next_index = calculate_next_index())
+    {
+      if (threads_memory_meta_[next_index].thread_running.load())
+      {
+        break;
+      }
+
+      threads_memory_meta_[memory_index_].available_size +=
+          threads_memory_meta_[next_index].available_size;
+    }
+  }
+
+  [[nodiscard]] std::size_t getAvailableSize() const noexcept
+  {
+//    tryBorrow();
+    return threads_memory_meta_[memory_index_].available_size;
+  }
+
+  void setThreadLocalMemoryIndex(const std::size_t index) noexcept
+  {
+    memory_index_ = index;
+  }
+  ~Memory()
+  {
+    delete[] memory_;
+    delete[] threads_memory_meta_;
+  }
+ private:
+  struct ThreadMemory
+  {
+    ElType* begin{};
+    std::size_t available_size{};
+    std::atomic_bool thread_running{};
+  };
+
+ public:
+  const std::size_t memory_per_thread_;
+  const std::size_t threads_count_;
+
+//  const std::unique_ptr<ThreadMemory[], std::default_delete<ThreadMemory[]>> threads_memory_meta_;
+  ThreadMemory* threads_memory_meta_;
+//  const std::unique_ptr<ElType[], std::default_delete<ElType[]>> memory_;
+  ElType* memory_;
+  inline static thread_local std::size_t memory_index_{0};
+};
+
+void finalize(std::ifstream& file, Memory::ElType* begin, const Memory::ElType* const end, std::ofstream& target)
+{
+  target.write(reinterpret_cast<const char*>(begin), sizeof(*begin) * (end - begin));
+
+  for (; !file.eof();)
+  {
+    Memory::ElType tmp[10000];
+
+    file.read(reinterpret_cast<char*>(&tmp), sizeof(tmp));
+    std::size_t num_of_red_bytes = sizeof(tmp);
     if (file.eof())
     {
-      break;
+      if (file.gcount())
+      {
+        num_of_red_bytes = file.gcount();
+      }
+      else
+      {
+        num_of_red_bytes = 0;
+      }
     }
-    target << tmp << '\n';
+    target.write(reinterpret_cast<char*>(&tmp), num_of_red_bytes);
   }
 }
 
 void merge(std::ifstream& file1, std::ifstream& file2, std::ofstream& target,
-           std::atomic_size_t& working_threads_num)
+           Memory& memory)
 {
-  //It is bad for cache, but easier for developer (dequeue probably would work faster)
-  std::list<std::string> file1_strings, file2_strings;
-
+  const auto begin_block = memory.memoryBegin();
+  Memory::ElType *cnt1, *end1;
+  Memory::ElType *beg2, *cnt2, *end2;
+  Memory::ElType *merge_beg, * merge_cnt{};
   for (; !file1.eof() || !file2.eof();)
   {
-    const std::size_t max_strings_in_current_thread = max_strings_in_memory /
-        working_threads_num.fetch_add(0, std::memory_order_relaxed);
+    const std::size_t available_memory = memory.getAvailableSize();
 
-    std::list<std::string> merged_strings;
-
-    for (int i = 0; file1_strings.size() < max_strings_in_current_thread / 2 && !file1.eof(); ++i)
+    if (merge_cnt)
     {
-      std::string tmp;
-      file1 >> tmp;
-      if (file1.eof())
+      //we need to replace memory
+
+      const auto new_beg2 = begin_block + available_memory / 4;
+
+      if (new_beg2 < end2 && new_beg2 > cnt2)
       {
-        break;
+        std::move_backward(cnt2, end2, new_beg2 + (end2 - cnt2));
+      }
+      else
+      {
+        std::move(cnt2, end2, begin_block + available_memory / 4);
+      }
+      if (begin_block != cnt1)
+      {
+        std::move(cnt1, end1, begin_block);
       }
 
-      file1_strings.push_back(std::move(tmp));
+      merge_beg = merge_cnt = begin_block + available_memory / 2;
+      end2 = begin_block + available_memory / 4 + (end2 - cnt2);
+      beg2 = cnt2 = begin_block + available_memory / 4;
+
+      end1 = begin_block + (end1 - cnt1);
+      cnt1 = begin_block;
+    }
+    else
+    {
+      cnt1 = end1 = begin_block;
+      beg2 = end2 = cnt2 = begin_block + available_memory / 4;
+      merge_beg = merge_cnt = begin_block + available_memory / 2;
     }
 
-    for (int i = 0; file2_strings.size() < max_strings_in_current_thread - file1_strings.size() && !file2.eof(); ++i)
     {
-      std::string tmp;
-      file2 >> tmp;
-      if (file2.eof())
-      {
-        break;
-      }
+      file1.read(reinterpret_cast<char*>(end1), sizeof(*beg2) * (beg2 - end1));
 
-      file2_strings.push_back(std::move(tmp));
-    }
-    //Way to use all memory
-    for (int i = 0; file1_strings.size() < max_strings_in_current_thread - file2_strings.size() && !file1.eof(); ++i)
-    {
-      std::string tmp;
-      file1 >> tmp;
-      if (file1.eof())
-      {
-        break;
-      }
-
-      file1_strings.push_back(std::move(tmp));
+      end1 += file1.gcount() / sizeof(*end1);
     }
 
-    if (file1.eof() && file1_strings.empty())
     {
-      finalize(file2, file2_strings, target);
+      file2.read(reinterpret_cast<char*>(end2), sizeof(*end2) * (merge_beg - end2));
+
+      end2 += file2.gcount() / sizeof(*end2);
+    }
+
+    if (file1.eof() && begin_block == end1)
+    {
+      finalize(file2, cnt2, end2, target);
       return;
     }
-    if (file2.eof() && file2_strings.empty())
+    if (file2.eof() && beg2 == end2)
     {
-      finalize(file1, file1_strings, target);
+      finalize(file1, cnt1, end1, target);
       return;
     }
 
-    for (auto it1 = file1_strings.begin(), it2 = file2_strings.begin(); it1 != file1_strings.cend() && it2 != file2_strings.cend();)
+    for (; cnt1 != end1 && cnt2 != end2;)
     {
-      using Pair = std::pair<decltype(it1)&, std::list<std::string>&>;
-      const Pair p = *it1 < *it2 ? Pair{it1, file1_strings} : Pair{it2, file2_strings};
-      merged_strings.splice(merged_strings.end(), p.second, p.first++);
+      auto& least = *cnt1 < *cnt2 ? cnt1 : cnt2;
+
+      *(merge_cnt++) = *(least++);
     }
 
-    for (const auto& el : merged_strings)
-    {
-      target << el << '\n';
-    }
+    target.write(reinterpret_cast<char*>(merge_beg), (merge_cnt - merge_beg) * sizeof(*merge_cnt));
   }
-  finalize(file2, file2_strings, target);
-  finalize(file1, file1_strings, target);
+  finalize(file2, cnt2, end2, target);
+  finalize(file1, cnt1, end1, target);
 }
 
-template <bool is_main_thread = false>
+template <bool is_main_thread>
 void processReduce(notifying_queue::DoublePopQueue<std::string>& files_queue,
                    std::atomic_size_t& working_threads_num,
                    std::atomic_size_t& files_enumerator,
                    std::atomic_size_t& num_of_remaining_files,
+                   Memory& memory,
                    const std::size_t thread_num)
 {
   for (;;)
@@ -186,57 +321,100 @@ void processReduce(notifying_queue::DoublePopQueue<std::string>& files_queue,
       std::ofstream target_file{new_file_name};
       std::ifstream file1{filename1}, file2{filename2};
 
-      merge(file1, file2, target_file, working_threads_num);
+      merge(file1, file2, target_file, memory);
     }
 
-    files_queue.push(std::move(new_file_name));
+    files_queue.pushForce(std::move(new_file_name));
 
     std::experimental::filesystem::remove(filename1);
     std::experimental::filesystem::remove(filename2);
   }
 }
 
+template <bool is_main_thread>
 struct ThreadAction
 {
   void operator()()
   {
+    auto& memory = *memory_ptr;
+    memory.setThreadLocalMemoryIndex(order_num);
+
     for (;;)
     {
+//      std::this_thread::sleep_for(std::chrono::milliseconds{10} * order_num);
+      std::cout << std::dec;
+      const std::size_t available_size = memory.getAvailableSize();
+//      std::cout << "After get size " << available_size << std::endl;
+      const std::size_t pos = red_bytes.fetch_add(available_size * sizeof(Memory::ElType), std::memory_order_relaxed);
+      if (pos >= file_size)
       {
-        std::vector<std::string> portion;
-        if (!map_queue.waitAndPop(portion))
-        {
-          break;
-        }
+        red_bytes.fetch_sub(available_size * sizeof(Memory::ElType), std::memory_order_relaxed);
+        break;
+      }
 
+      num_of_remaining_files.fetch_add(1, std::memory_order_relaxed);
+
+//      std::cout << "before seek" << std::endl;
+      ifstream.seekg(pos, std::ios::beg);
+//      std::cout << "after seek" << std::endl;
+
+      const auto block_begin = memory.memoryBegin();
+
+      if (block_begin + available_size > memory.memory_ + memory.memory_per_thread_ * memory.threads_count_)
+      {
+        throw std::runtime_error{"too large block"};
+      }
+
+      ifstream.read(reinterpret_cast<char*>(block_begin), sizeof(block_begin[0]) * available_size);
+//      std::cout << "gcount: " << ifstream.gcount() << std::endl;
+      const std::size_t ints_red = ifstream.gcount() / sizeof(block_begin[0]);
+
+      if (ints_red == 0)
+      {
+        throw std::runtime_error{"God, 0! " + std::to_string(file_size) + ", " + std::to_string(pos) + ", " + std::to_string(ifstream.fail())};
+      }
+
+//      std::cout << "After read, " << ints_red << std::endl;
+
+      {
         const std::size_t file_index = files_enumerator.fetch_add(1, std::memory_order_relaxed);
 
         std::string filename{"tmp" + std::to_string(file_index)};
 
         {
-          std::ofstream file{filename};
+          const auto block_end = block_begin + ints_red;
+//          std::cout << "thread " << order_num << ", index " << memory.memory_index_ << " block to sort: " << std::hex  << block_begin << ", " << block_end << std::endl;
+          std::ofstream file{filename, std::ios::binary};
 
-          std::sort(std::begin(portion), std::end(portion));
-
-          for (const auto &str : portion)
+          if (block_begin + ints_red > memory.memory_ + memory.memory_per_thread_ * memory.threads_count_)
           {
-            file << str << '\n';
+            throw std::runtime_error{"too large block red"};
           }
-        }
-        blocks_in_memory.fetch_sub(1, std::memory_order_relaxed);
 
-        file_names.push(std::move(filename));
+          std::sort(block_begin, block_begin + ints_red, std::less<Memory::ElType>{});
+
+          file.write(reinterpret_cast<char*>(block_begin), sizeof(block_begin[0]) * ints_red);
+          std::cout << std::dec;
+        }
+        file_names.pushForce(std::move(filename));
       }
-      may_continue_reading.notify_one();
     }
 
-    processReduce(file_names, num_of_working_threads, files_enumerator, num_of_remaining_files, order_num);
+//    std::cout << "Before reduce, thread " << order_num << std::endl;
+
+    processReduce<is_main_thread>(file_names, num_of_working_threads, files_enumerator,
+        num_of_remaining_files, memory, order_num);
+
+    memory.finishThread();
   }
+  std::ifstream ifstream;
+  const uint64_t file_size;
+  std::atomic_uint64_t& red_bytes;
+
+  std::shared_ptr<Memory> memory_ptr;
+
   std::atomic_size_t& num_of_working_threads;
   std::atomic_size_t& num_of_remaining_files;
-  notifying_queue::Queue<std::vector<std::string>>& map_queue;
-  std::condition_variable& may_continue_reading;
-  std::atomic_size_t& blocks_in_memory;
   notifying_queue::DoublePopQueue<std::string>& file_names;
   std::atomic_size_t& files_enumerator;
 
@@ -251,10 +429,10 @@ int main(const int argc, const char* const argv[])
     return -1;
   }
 
-  std::fstream file{argv[1]};
+  std::ifstream file{argv[1], std::ifstream::ate | std::ifstream::binary};
   if (file.fail())
   {
-    std::cerr << "Fail to open file " << argv[0] << std::endl;
+    std::cerr << "Fail to open file " << argv[0] <<  "0 item" << std::endl;
     return -2;
   }
 
@@ -268,81 +446,71 @@ int main(const int argc, const char* const argv[])
   }();
 
   //2 Mb to queue and 1 for metainfo in constructors
-  constexpr uint32_t available_memory = (128 - 3) * 1024 * 1024;
+  constexpr uint32_t available_memory = /*(128 - 3) * 1024 * 1024*/ 1024;
 
-  const uint32_t memory_by_thread = available_memory / num_of_threads;
-  uint32_t* const all_memory = new uint32_t[memory_by_thread * num_of_threads];
+  const auto memory = std::make_shared<Memory>(num_of_threads, available_memory);
+  {
+    std::ofstream adr_file{"adr_file"};
 
-  const std::size_t strings_by_thread{max_strings_in_memory / num_of_threads};
+    adr_file << std::hex << "block " <<  memory->memory_ << ", " << memory->memory_ + memory->memory_per_thread_ * memory->threads_count_ << std::endl;
+    adr_file << "Memory per thread " << std::dec << memory->memory_per_thread_ << std::endl;
+    adr_file << num_of_threads << std::endl;
+
+    for (std::size_t i = 0; i < num_of_threads; ++i)
+    {
+      adr_file << std::hex << memory->threads_memory_meta_[i].begin << ", size " << std::dec << memory->threads_memory_meta_[i].available_size << std::endl;
+    }
+  }
+
+
   const std::size_t num_of_threads_to_create{num_of_threads - 1};
-
-
-  //I could use byte buffers instead of vectors of strings (to avoid allocations), it might increase performance
-  //But I guess allocations is not bottle neck here because io operations probably take much more time
-  //And coding with bytes buffers would take 2 hours more
-  notifying_queue::Queue<std::vector<std::string>> raw_strings_queue;
-  std::condition_variable may_continue;
-  std::atomic_size_t blocks_in_memory{0};
 
   std::atomic_size_t num_of_working_threads{1};
   std::atomic_size_t num_of_remaining_files{0};
   std::atomic_size_t files_enumerator{0};
 
+  std::atomic_uint64_t red_bytes{0};
+
   notifying_queue::DoublePopQueue<std::string> file_names;
+
+
+  uint64_t file_size = file.tellg();
+  file.close();
 
   for (std::size_t i{}; i < num_of_threads_to_create; ++i)
   {
-    ThreadAction action{num_of_working_threads, num_of_remaining_files,
-                        raw_strings_queue, may_continue, blocks_in_memory, file_names,
-                        files_enumerator, i};
+    file.open(argv[1], std::ios::binary);
+    if (file.fail())
+    {
+      std::cerr << "Can not open file, " << i << " item" << std::endl;
+      std::terminate();
+    }
+    ThreadAction<false> action{std::move(file), file_size, red_bytes, memory, num_of_working_threads, num_of_remaining_files,
+                        file_names,
+                        files_enumerator, i + 1};
 
     num_of_working_threads.fetch_add(1, std::memory_order_relaxed);
-    std::thread t{action};
+    std::thread t{std::move(action)};
     t.detach();
   }
 
+  file.open(argv[1], std::ios::binary);
+  if (file.fail())
   {
-    std::vector<std::string> strings_portion;
-    waitAndReserve(may_continue, blocks_in_memory, num_of_threads,
-                strings_portion, strings_by_thread);
-
-    int cnt{};
-
-    for (;;)
-    {
-      std::string current;
-
-      file >> current;
-
-      if (file.eof())
-      {
-        if (!strings_portion.empty())
-        {
-          num_of_remaining_files.fetch_add(1, std::memory_order_relaxed);
-          raw_strings_queue.push(std::move(strings_portion));
-        }
-        break;
-      }
-      ++cnt;
-
-      strings_portion.push_back(std::move(current));
-      if (strings_portion.size() == strings_by_thread)
-      {
-        num_of_remaining_files.fetch_add(1, std::memory_order_relaxed);
-        raw_strings_queue.push(std::move(strings_portion));
-        waitAndReserve(may_continue, blocks_in_memory, num_of_threads,
-                       strings_portion, strings_by_thread);
-      }
-    }
-
-    raw_strings_queue.finish();
-
-    waitForFreeMemory(may_continue, blocks_in_memory, num_of_threads);
+    std::cerr << "Can not open file for main thread" << std::endl;
+    std::terminate();
   }
 
-  //I'm not sure that multithread reduce will be always faster, it depends on current system, disk, cpu, la, ...
-  //It need ti be profiled
-  processReduce<true>(file_names, num_of_working_threads, files_enumerator, num_of_remaining_files, 0);
+  ThreadAction<true>{std::move(file), file_size, red_bytes, memory,
+               num_of_working_threads, num_of_remaining_files,
+               file_names,
+               files_enumerator, 0}();
+
+  if (memory->memory_index_ == 0)
+  {
+    std::cout << "Main thread is out" << std::endl;
+//    std::this_thread::sleep_for(std::chrono::seconds{2});
+  }
 
   return 0;
 }

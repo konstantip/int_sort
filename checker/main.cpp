@@ -31,14 +31,14 @@ int main(const int argc, const char* const argv[])
 
   {
     uint32_t prev;
-    result >> prev;
+    result.read(reinterpret_cast<char*>(&prev), sizeof(prev));
     if (!result.eof())
     {
       for (;;)
       {
         map.emplace(prev);
         uint32_t current;
-        result >> current;
+        result.read(reinterpret_cast<char*>(&current), sizeof(current));
         if (result.eof())
         {
           break;
@@ -59,7 +59,7 @@ int main(const int argc, const char* const argv[])
     for (;;)
     {
       uint32_t current;
-      source >> current;
+      source.read(reinterpret_cast<char*>(&current), sizeof(current));
       if (source.eof())
       {
         break;
@@ -85,20 +85,20 @@ int main(const int argc, const char* const argv[])
     
     if (!missed.empty())
     {
-      fails << "Missed strings: \n";
+      fails << "Missed numbers: \n";
 
       for (const auto& el : missed)
       {
-        fails << el;
+        fails << std::hex << el << '\n';
       }
     }
     if (!map.empty())
     {
-      fails << "additional strings: \n";
+      fails << "additional numbers: \n";
 
       for (const auto& el : map)
       {
-        fails << el;
+        fails << std::hex << el << '\n';
       }
     }
 
