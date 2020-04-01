@@ -409,7 +409,7 @@ int main(const int argc, const char* const argv[])
   }();
 
   //2 Mb to queue and 1 for metainfo in constructors
-  constexpr uint32_t available_memory = (128 - 3) * 1024 * 1024;
+  constexpr uint32_t available_memory = (128 - 1) * 1024 * 1024;
 
   Memory memory{num_of_threads, available_memory};
 
