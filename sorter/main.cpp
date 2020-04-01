@@ -161,17 +161,17 @@ class Memory final
   inline static thread_local std::size_t memory_index_{0};
 };
 
-void finalize(std::ifstream& file, Memory::ElType* begin, const Memory::ElType* const end, std::ofstream& target)
+void finalize(std::ifstream& file, const Memory::ElType* const begin, 
+             const Memory::ElType* const end, Memory::ElType* const  buffer_begin, 
+             const Memory::ElType* const buffer_end, std::ofstream& target)
 {
   target.write(reinterpret_cast<const char*>(begin), sizeof(*begin) * (end - begin));
 
   for (; !file.eof();)
   {
-    Memory::ElType tmp[10000];
-
-    file.read(reinterpret_cast<char*>(&tmp), sizeof(tmp));
+    file.read(reinterpret_cast<char*>(buffer_begin), sizeof(*buffer_begin) * (buffer_end - buffer_begin));
     std::size_t num_of_red_bytes = file.gcount();
-    target.write(reinterpret_cast<char*>(&tmp), num_of_red_bytes);
+    target.write(reinterpret_cast<char*>(buffer_begin), num_of_red_bytes);
   }
 }
 
@@ -182,7 +182,7 @@ void merge(std::ifstream& file1, std::ifstream& file2, std::ofstream& target,
   Memory::ElType *cnt1, *end1;
   Memory::ElType *beg2, *cnt2, *end2;
   Memory::ElType *merge_beg, * merge_cnt{};
-  for (; !file1.eof() || !file2.eof();)
+  for (; ;)
   {
     const std::size_t available_memory = memory.getAvailableSize();
 
@@ -234,12 +234,12 @@ void merge(std::ifstream& file1, std::ifstream& file2, std::ofstream& target,
 
     if (file1.eof() && begin_block == end1)
     {
-      finalize(file2, cnt2, end2, target);
+      finalize(file2, cnt2, end2, begin_block, begin_block + available_memory, target);
       return;
     }
     if (file2.eof() && beg2 == end2)
     {
-      finalize(file1, cnt1, end1, target);
+      finalize(file1, cnt1, end1, begin_block, begin_block + available_memory, target);
       return;
     }
 
@@ -252,8 +252,6 @@ void merge(std::ifstream& file1, std::ifstream& file2, std::ofstream& target,
 
     target.write(reinterpret_cast<char*>(merge_beg), (merge_cnt - merge_beg) * sizeof(*merge_cnt));
   }
-  finalize(file2, cnt2, end2, target);
-  finalize(file1, cnt1, end1, target);
 }
 
 template <bool is_main_thread>
@@ -421,7 +419,7 @@ int main(const int argc, const char* const argv[])
 
   std::atomic_uint64_t red_bytes{0};
 
-  notifying_queue::DoublePopQueue<std::string> file_names;
+  notifying_queue::DoublePopQueue<std::string> file_names{1024 * 100};
 
 
   uint64_t file_size = file.tellg();
