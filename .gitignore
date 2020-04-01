@@ -7,3 +7,4 @@ source
 */cmake-build-debug/
 .idea
 adr_file
+*/.*.swp

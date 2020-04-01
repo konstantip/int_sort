@@ -37,6 +37,7 @@ class Memory final
       memory_per_thread_{(num_of_byte / threads_count) / sizeof(ElType)},
       threads_count_{threads_count},
       threads_memory_meta_{new ThreadMemory[threads_count]{}},
+      function_{new std::size_t[threads_count_]},
       memory_{new ElType[memory_per_thread_ * threads_count]}
   {
     bool used_blocks[threads_count];
@@ -45,9 +46,10 @@ class Memory final
 
     {
       auto& el = threads_memory_meta_[0];
-      el.begin = memory_;
+      el.begin = memory_.get();
       el.available_size = memory_per_thread_;
       el.thread_running = true;
+      function_[0] = 0;
     }
     used_blocks[0] = true;
     for (std::size_t thread_num = 1; thread_num < threads_count;)
@@ -65,6 +67,7 @@ class Memory final
 
           {
             const std::size_t index_of_data = prev_index + (i - prev_index) / 2;
+	    function_[index_of_data] = thread_num;
 
             auto& el = threads_memory_meta_[thread_num];
 
@@ -81,6 +84,7 @@ class Memory final
 
       {
         const std::size_t index_of_data = prev_index + (threads_count_ - prev_index) / 2;
+	function_[index_of_data] = thread_num;
         auto& el = threads_memory_meta_[thread_num];
         el.begin = &memory_[index_of_data * memory_per_thread_];
         el.available_size = memory_per_thread_;
@@ -99,16 +103,17 @@ class Memory final
 
   void finishThread() const noexcept
   {
-    threads_memory_meta_[memory_index_].thread_running = false;
+    threads_memory_meta_[memory_index_].thread_running.exchange(false, std::memory_order_relaxed);
   }
 
   void tryBorrow() const noexcept
   {
-    const auto calculate_next_index = [mi{memory_index_},
-        & available_mem = threads_memory_meta_[memory_index_].available_size,
+    const auto calculate_next_index = [
+	start_buffer_ptr{memory_.get()},
+        &available_mem{threads_memory_meta_[memory_index_].available_size},
+	begin{threads_memory_meta_[memory_index_].begin},
         memory_per_thread{memory_per_thread_}]() noexcept -> std::size_t {
-      return mi +
-          available_mem / memory_per_thread;
+      return (begin - start_buffer_ptr + available_mem) / memory_per_thread;
     };
 
     const auto index_exists = [size{threads_count_}](const std::size_t index) {
@@ -117,6 +122,7 @@ class Memory final
 
     for (auto next_index = calculate_next_index(); index_exists(next_index); next_index = calculate_next_index())
     {
+      next_index = function_[next_index];
       if (threads_memory_meta_[next_index].thread_running.load())
       {
         break;
@@ -129,7 +135,7 @@ class Memory final
 
   [[nodiscard]] std::size_t getAvailableSize() const noexcept
   {
-//    tryBorrow();
+    tryBorrow();
     return threads_memory_meta_[memory_index_].available_size;
   }
 
@@ -137,16 +143,11 @@ class Memory final
   {
     memory_index_ = index;
   }
-  ~Memory()
-  {
-    delete[] memory_;
-    delete[] threads_memory_meta_;
-  }
  private:
   struct ThreadMemory
   {
     ElType* begin{};
-    std::size_t available_size{};
+    std::atomic_size_t available_size{};
     std::atomic_bool thread_running{};
   };
 
@@ -154,10 +155,9 @@ class Memory final
   const std::size_t memory_per_thread_;
   const std::size_t threads_count_;
 
-//  const std::unique_ptr<ThreadMemory[], std::default_delete<ThreadMemory[]>> threads_memory_meta_;
-  ThreadMemory* threads_memory_meta_;
-//  const std::unique_ptr<ElType[], std::default_delete<ElType[]>> memory_;
-  ElType* memory_;
+  const std::unique_ptr<ThreadMemory[], std::default_delete<ThreadMemory[]>> threads_memory_meta_;
+  const std::unique_ptr<std::size_t[], std::default_delete<std::size_t[]>> function_;
+  const std::unique_ptr<ElType[], std::default_delete<ElType[]>> memory_;
   inline static thread_local std::size_t memory_index_{0};
 };
 
@@ -170,18 +170,7 @@ void finalize(std::ifstream& file, Memory::ElType* begin, const Memory::ElType* 
     Memory::ElType tmp[10000];
 
     file.read(reinterpret_cast<char*>(&tmp), sizeof(tmp));
-    std::size_t num_of_red_bytes = sizeof(tmp);
-    if (file.eof())
-    {
-      if (file.gcount())
-      {
-        num_of_red_bytes = file.gcount();
-      }
-      else
-      {
-        num_of_red_bytes = 0;
-      }
-    }
+    std::size_t num_of_red_bytes = file.gcount();
     target.write(reinterpret_cast<char*>(&tmp), num_of_red_bytes);
   }
 }
@@ -203,13 +192,13 @@ void merge(std::ifstream& file1, std::ifstream& file2, std::ofstream& target,
 
       const auto new_beg2 = begin_block + available_memory / 4;
 
-      if (new_beg2 < end2 && new_beg2 > cnt2)
+      if (new_beg2 < end2 && new_beg2 >= cnt2)
       {
         std::move_backward(cnt2, end2, new_beg2 + (end2 - cnt2));
       }
       else
       {
-        std::move(cnt2, end2, begin_block + available_memory / 4);
+        std::move(cnt2, end2, new_beg2);
       }
       if (begin_block != cnt1)
       {
@@ -217,8 +206,8 @@ void merge(std::ifstream& file1, std::ifstream& file2, std::ofstream& target,
       }
 
       merge_beg = merge_cnt = begin_block + available_memory / 2;
-      end2 = begin_block + available_memory / 4 + (end2 - cnt2);
-      beg2 = cnt2 = begin_block + available_memory / 4;
+      end2 = new_beg2 + (end2 - cnt2);
+      beg2 = cnt2 = new_beg2;
 
       end1 = begin_block + (end1 - cnt1);
       cnt1 = begin_block;
@@ -231,6 +220,7 @@ void merge(std::ifstream& file1, std::ifstream& file2, std::ofstream& target,
     }
 
     {
+      
       file1.read(reinterpret_cast<char*>(end1), sizeof(*beg2) * (beg2 - end1));
 
       end1 += file1.gcount() / sizeof(*end1);
@@ -336,15 +326,12 @@ struct ThreadAction
 {
   void operator()()
   {
-    auto& memory = *memory_ptr;
+    std::atomic_thread_fence(std::memory_order_acquire);
     memory.setThreadLocalMemoryIndex(order_num);
 
     for (;;)
     {
-//      std::this_thread::sleep_for(std::chrono::milliseconds{10} * order_num);
-      std::cout << std::dec;
       const std::size_t available_size = memory.getAvailableSize();
-//      std::cout << "After get size " << available_size << std::endl;
       const std::size_t pos = red_bytes.fetch_add(available_size * sizeof(Memory::ElType), std::memory_order_relaxed);
       if (pos >= file_size)
       {
@@ -354,27 +341,12 @@ struct ThreadAction
 
       num_of_remaining_files.fetch_add(1, std::memory_order_relaxed);
 
-//      std::cout << "before seek" << std::endl;
       ifstream.seekg(pos, std::ios::beg);
-//      std::cout << "after seek" << std::endl;
 
       const auto block_begin = memory.memoryBegin();
 
-      if (block_begin + available_size > memory.memory_ + memory.memory_per_thread_ * memory.threads_count_)
-      {
-        throw std::runtime_error{"too large block"};
-      }
-
       ifstream.read(reinterpret_cast<char*>(block_begin), sizeof(block_begin[0]) * available_size);
-//      std::cout << "gcount: " << ifstream.gcount() << std::endl;
       const std::size_t ints_red = ifstream.gcount() / sizeof(block_begin[0]);
-
-      if (ints_red == 0)
-      {
-        throw std::runtime_error{"God, 0! " + std::to_string(file_size) + ", " + std::to_string(pos) + ", " + std::to_string(ifstream.fail())};
-      }
-
-//      std::cout << "After read, " << ints_red << std::endl;
 
       {
         const std::size_t file_index = files_enumerator.fetch_add(1, std::memory_order_relaxed);
@@ -382,14 +354,7 @@ struct ThreadAction
         std::string filename{"tmp" + std::to_string(file_index)};
 
         {
-          const auto block_end = block_begin + ints_red;
-//          std::cout << "thread " << order_num << ", index " << memory.memory_index_ << " block to sort: " << std::hex  << block_begin << ", " << block_end << std::endl;
           std::ofstream file{filename, std::ios::binary};
-
-          if (block_begin + ints_red > memory.memory_ + memory.memory_per_thread_ * memory.threads_count_)
-          {
-            throw std::runtime_error{"too large block red"};
-          }
 
           std::sort(block_begin, block_begin + ints_red, std::less<Memory::ElType>{});
 
@@ -400,8 +365,6 @@ struct ThreadAction
       }
     }
 
-//    std::cout << "Before reduce, thread " << order_num << std::endl;
-
     processReduce<is_main_thread>(file_names, num_of_working_threads, files_enumerator,
         num_of_remaining_files, memory, order_num);
 
@@ -411,7 +374,7 @@ struct ThreadAction
   const uint64_t file_size;
   std::atomic_uint64_t& red_bytes;
 
-  std::shared_ptr<Memory> memory_ptr;
+  Memory& memory;
 
   std::atomic_size_t& num_of_working_threads;
   std::atomic_size_t& num_of_remaining_files;
@@ -446,22 +409,9 @@ int main(const int argc, const char* const argv[])
   }();
 
   //2 Mb to queue and 1 for metainfo in constructors
-  constexpr uint32_t available_memory = /*(128 - 3) * 1024 * 1024*/ 1024;
+  constexpr uint32_t available_memory = (128 - 3) * 1024 * 1024;
 
-  const auto memory = std::make_shared<Memory>(num_of_threads, available_memory);
-  {
-    std::ofstream adr_file{"adr_file"};
-
-    adr_file << std::hex << "block " <<  memory->memory_ << ", " << memory->memory_ + memory->memory_per_thread_ * memory->threads_count_ << std::endl;
-    adr_file << "Memory per thread " << std::dec << memory->memory_per_thread_ << std::endl;
-    adr_file << num_of_threads << std::endl;
-
-    for (std::size_t i = 0; i < num_of_threads; ++i)
-    {
-      adr_file << std::hex << memory->threads_memory_meta_[i].begin << ", size " << std::dec << memory->threads_memory_meta_[i].available_size << std::endl;
-    }
-  }
-
+  Memory memory{num_of_threads, available_memory};
 
   const std::size_t num_of_threads_to_create{num_of_threads - 1};
 
@@ -476,6 +426,8 @@ int main(const int argc, const char* const argv[])
 
   uint64_t file_size = file.tellg();
   file.close();
+
+  std::atomic_thread_fence(std::memory_order_release);
 
   for (std::size_t i{}; i < num_of_threads_to_create; ++i)
   {
@@ -505,12 +457,6 @@ int main(const int argc, const char* const argv[])
                num_of_working_threads, num_of_remaining_files,
                file_names,
                files_enumerator, 0}();
-
-  if (memory->memory_index_ == 0)
-  {
-    std::cout << "Main thread is out" << std::endl;
-//    std::this_thread::sleep_for(std::chrono::seconds{2});
-  }
 
   return 0;
 }
